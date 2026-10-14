@@ -1,0 +1,80 @@
+id = "herdr-jira"
+name = "Jira"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Your Jira issues and projects in a herdr popup: status icons, rendered descriptions, status changes, and one key to a worktree for any issue, or to start it with /ticket in a new agent. Signs in with an Atlassian API token."
+# Tokens live in the macOS login keychain, or the Secret Service on Linux.
+platforms = ["macos", "linux"]
+
+# Builds ./bin/herdr-jira from source with Go.
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+# Bind it to a key in ~/.config/herdr/config.toml:
+#   [[keys.command]]
+#   key = "prefix+alt+j"
+#   type = "plugin_action"
+#   command = "herdr-jira.open"
+[[actions]]
+id = "open"
+title = "Jira: issues and projects"
+description = "Pick an issue or project and jump to its worktree, creating it if needed."
+contexts = ["global", "workspace", "pane"]
+command = ["./bin/herdr-jira", "action", "open"]
+
+[[actions]]
+id = "demo"
+title = "Jira: demo (fictional workspace)"
+description = "The picker on made-up data: try it without an account, or take screenshots without showing real work."
+contexts = ["global"]
+command = ["./bin/herdr-jira", "action", "demo"]
+
+[[actions]]
+id = "logout"
+title = "Jira: sign out"
+description = "Forget Jira credentials locally."
+contexts = ["global"]
+command = ["./bin/herdr-jira", "action", "logout"]
+
+# The picker, opened by the actions above with the invoking space's directory
+# (or the demo flag) in its env. It also runs API token sign-in when you're
+# not connected.
+[[panes]]
+id = "picker"
+title = "Jira"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["./bin/herdr-jira", "picker"]
+
+# Sidebar labels. `tick` sets the $issue, $issue_state and $issue_title tokens
+# on each space and agent whose branch is named for a Jira issue
+# ("me/eng-142-fix-login"). It returns at once when it ran moments ago, and
+# only asks Jira about an issue whose answer is older than
+# label_refresh_seconds (120 by default).
+[[startup]]
+command = ["./bin/herdr-jira", "tick", "--force"]
+
+# Switching space or pane: the cheapest moment to catch up.
+[[events]]
+on = "pane.focused"
+command = ["./bin/herdr-jira", "tick"]
+
+# An agent starting or finishing is when a branch, or an issue's status, moves.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./bin/herdr-jira", "tick"]
+
+# A new space, or a worktree opened into one: label it straight away.
+[[events]]
+on = "workspace.created"
+command = ["./bin/herdr-jira", "tick"]
+
+[[events]]
+on = "worktree.created"
+command = ["./bin/herdr-jira", "tick"]
+
+[[events]]
+on = "worktree.opened"
+command = ["./bin/herdr-jira", "tick"]
+

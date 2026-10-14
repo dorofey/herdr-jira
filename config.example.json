@@ -1,0 +1,10 @@
+{
+  "repos": {
+    "APP": "~/work/app"
+  },
+  "start_prompt": "Work on the Jira issue {identifier}: {url}",
+  "agent_wait_seconds": 90,
+  "token_store": "auto",
+  "label_refresh_seconds": 120,
+  "labels": true
+}

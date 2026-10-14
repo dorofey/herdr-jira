@@ -1,0 +1,135 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+type config struct {
+	// Base is the ref new worktrees branch from. Empty = the remote's default
+	// branch (origin/HEAD), falling back to origin/main.
+	Base string `json:"base"`
+	// StartPrompt is sent to the new worktree's agent by "start". {identifier},
+	// {title} and {url} are substituted. Empty: /ticket where there's a ticket
+	// command for Claude Code, a plain prompt elsewhere (startPrompt).
+	StartPrompt string `json:"start_prompt"`
+	// ProjectStartPrompt is what starting a project sends its new worktree's
+	// agent. {name} and {url} are substituted.
+	ProjectStartPrompt string `json:"project_start_prompt"`
+	// Repos maps a Jira team key to a checkout, for when the picker is opened
+	// from a space that is not inside that team's repo.
+	Repos map[string]string `json:"repos"`
+	// AgentWaitSeconds bounds how long "start" waits for an agent to come up in
+	// the new worktree before giving up on sending the prompt.
+	AgentWaitSeconds int `json:"agent_wait_seconds"`
+	// Theme for rendered Markdown: "dark", "light", or empty to ask the terminal.
+	Theme string `json:"theme"`
+	// TokenStore is where Linux keeps the sign-in: "auto" (the default: the
+	// keyring, or a file when there's no Secret Service), "keyring" or "file".
+	// macOS always uses the keychain.
+	TokenStore string `json:"token_store"`
+	// Labels turns the sidebar tokens ($issue, $issue_state, $issue_title)
+	// on or off.
+	Labels *bool `json:"labels"`
+	// LabelRefreshSeconds is how old an issue's status may get before a
+	// tick asks Jira again.
+	LabelRefreshSeconds int `json:"label_refresh_seconds"`
+}
+
+func (c config) labelsOn() bool { return c.Labels == nil || *c.Labels }
+
+// tokenStore is config's TokenStore, set once it's read, for the token
+// storage, which is reached from everywhere without the config.
+var tokenStore = "auto"
+
+func pluginID() string {
+	if id := os.Getenv("HERDR_PLUGIN_ID"); id != "" {
+		return id
+	}
+	return "herdr-jira"
+}
+
+func xdgDir(env, fallback string) string {
+	if v := os.Getenv(env); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, fallback)
+}
+
+func configDir() string {
+	if d := os.Getenv("HERDR_PLUGIN_CONFIG_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(xdgDir("XDG_CONFIG_HOME", ".config"), "herdr", "plugins", "config", pluginID())
+}
+
+func stateDir() string {
+	if d := os.Getenv("HERDR_PLUGIN_STATE_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(xdgDir("XDG_STATE_HOME", ".local/state"), "herdr", "plugins", pluginID())
+}
+
+// loadConfig reads config.json. On error it still returns the defaults, so
+// commands that don't depend on your settings (sign out, status) keep working
+// while the file is broken.
+func loadConfig() (config, error) {
+	cfg, err := readConfig()
+	if err != nil {
+		cfg = config{}
+	}
+	return withDefaults(cfg), err
+}
+
+func readConfig() (config, error) {
+	cfg := config{}
+	data, err := os.ReadFile(filepath.Join(configDir(), "config.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return cfg, err
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return cfg, errors.New("config.json: " + err.Error())
+		}
+	}
+	switch cfg.TokenStore {
+	case "", "auto", "keyring", "file":
+	default:
+		return cfg, fmt.Errorf("config.json: token_store is %q; it's \"auto\", \"keyring\" or \"file\"", cfg.TokenStore)
+	}
+	return cfg, nil
+}
+
+func withDefaults(cfg config) config {
+	if cfg.ProjectStartPrompt == "" {
+		// Not {name}: anyone in the workspace can write it, and the agent
+		// would read it as instructions (the same caution as {title}).
+		cfg.ProjectStartPrompt = "Work on the Jira project at {url}"
+	}
+	if cfg.TokenStore == "" {
+		cfg.TokenStore = "auto"
+	}
+	if cfg.AgentWaitSeconds <= 0 {
+		cfg.AgentWaitSeconds = 90
+	}
+	if cfg.LabelRefreshSeconds <= 0 {
+		cfg.LabelRefreshSeconds = 120
+	}
+	for k, v := range cfg.Repos {
+		cfg.Repos[k] = expandHome(v)
+	}
+	return cfg
+}
+
+func expandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, strings.TrimPrefix(p, "~"))
+	}
+	return p
+}

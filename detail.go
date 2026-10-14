@@ -1,0 +1,510 @@
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type screen int
+
+const (
+	screenList screen = iota
+	screenIssue
+	screenProject
+	screenStatus  // the status picker, over the issue screen
+	screenCreate  // the new issue form (create.go)
+	screenCreated // what was just created, and what next
+)
+
+// Like the list loads, these carry the gen they were asked for under.
+type issueDetailMsg struct {
+	id     string
+	detail *issueDetail
+	err    error
+	gen    int
+}
+type projectDetailMsg struct {
+	id     string
+	detail *projectDetail
+	err    error
+	gen    int
+}
+type statesMsg struct {
+	teamID string
+	states []workflowState
+	err    error
+	gen    int
+}
+type stateSetMsg struct {
+	issueID string
+	state   workflowState
+	err     error
+}
+
+// ── opening ───────────────────────────────────────────────────────────────────
+
+func (m model) openIssue(is issue) (tea.Model, tea.Cmd) {
+	m.screen, m.cur, m.curDetail, m.err, m.flash, m.scroll = screenIssue, &is, nil, "", "", 0
+	client, ctx, gen := m.client, m.ctx, m.gen
+	return m, func() tea.Msg {
+		d, err := client.issueDetail(ctx, is.ID)
+		return issueDetailMsg{is.ID, d, err, gen}
+	}
+}
+
+func (m model) openProject(p project) (tea.Model, tea.Cmd) {
+	m.screen, m.curProject, m.projDetail, m.err, m.flash, m.scroll = screenProject, &p, nil, "", "", 0
+	client, ctx, gen := m.client, m.ctx, m.gen
+	return m, func() tea.Msg {
+		d, err := client.projectDetail(ctx, p.ID)
+		return projectDetailMsg{p.ID, d, err, gen}
+	}
+}
+
+func (m model) openStatusPicker() (tea.Model, tea.Cmd) {
+	m.screen, m.err, m.flash = screenStatus, "", ""
+
+	teamID, client, ctx, gen := m.cur.ID, m.client, m.ctx, m.gen
+	return m, func() tea.Msg {
+		s, err := client.teamStates(ctx, teamID)
+		return statesMsg{teamID, s, err, gen}
+	}
+}
+
+func (m *model) placeStateCursor() {
+	m.stateCursor = 0
+	for i, s := range m.states[m.cur.ID] {
+		if s.ID == m.cur.State.ID {
+			m.stateCursor = i
+		}
+	}
+}
+
+// ── messages ──────────────────────────────────────────────────────────────────
+
+func (m model) updateDetail(msg tea.Msg) (model, bool) {
+	switch msg := msg.(type) {
+	case issueDetailMsg:
+		if msg.gen == m.gen && m.cur != nil && m.cur.ID == msg.id {
+			if !m.handleLoadErr(msg.err) {
+				m.curDetail = msg.detail
+			}
+		}
+		return m, true
+	case projectDetailMsg:
+		if msg.gen == m.gen && m.curProject != nil && m.curProject.ID == msg.id {
+			if !m.handleLoadErr(msg.err) {
+				m.projDetail = msg.detail
+			}
+		}
+		return m, true
+	case statesMsg:
+		if msg.gen != m.gen {
+			return m, true
+		}
+		if m.handleLoadErr(msg.err) {
+			if m.screen == screenStatus {
+				m.screen = screenIssue
+			}
+			return m, true
+		}
+		m.states[msg.teamID] = msg.states
+		if m.screen == screenStatus && m.cur != nil && m.cur.ID == msg.teamID {
+			m.placeStateCursor()
+		}
+		return m, true
+	case stateSetMsg:
+		m.mode = modeList
+		if m.handleLoadErr(msg.err) {
+			return m, true
+		}
+		delete(m.states, msg.issueID)
+		m.applyState(msg.issueID, msg.state)
+		m.flash = "Moved to " + msg.state.Name
+		return m, true
+	}
+	return m, false
+}
+
+// applyState updates the issue everywhere it is listed, so the lists are right
+// without a refetch.
+// Both lists hold open issues only, so an issue moved to Done or Canceled
+// leaves them; the issue screen you're on keeps showing it.
+func (m *model) applyState(issueID string, s workflowState) {
+	update := func(list []issue) []issue {
+		out := list[:0]
+		for _, x := range list {
+			if x.ID == issueID {
+				if !isOpenState(s.Type) {
+					continue
+				}
+				x.State = s
+			}
+			out = append(out, x)
+		}
+		sortIssues(out)
+		return out
+	}
+	m.issues, m.projIss = update(m.issues), update(m.projIss)
+	// Searched for, or filed by you: these stay listed even when closed.
+	for _, list := range [][]issue{m.lookup, m.recent} {
+		for i := range list {
+			if list[i].ID == issueID {
+				list[i].State = s
+			}
+		}
+	}
+	if m.cur != nil && m.cur.ID == issueID {
+		m.cur.State = s
+	}
+	m.clampCursor()
+}
+
+// ── keys ──────────────────────────────────────────────────────────────────────
+
+func (m model) handleDetailKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.screen {
+	case screenStatus:
+		states := m.states[m.cur.ID]
+		switch k.String() {
+		case "esc", "c":
+			m.screen = screenIssue
+		case "up", "k", "ctrl+p":
+			m.stateCursor = max(0, m.stateCursor-1)
+		case "down", "j", "ctrl+n":
+			if len(states) > 0 { // still loading: nothing to move over
+				m.stateCursor = min(len(states)-1, m.stateCursor+1)
+			}
+		case "enter":
+			if m.stateCursor >= 0 && m.stateCursor < len(states) {
+				s := states[m.stateCursor]
+				m.screen = screenIssue
+
+				m.mode, m.status = modeBusy, "Moving "+m.cur.Identifier+" to "+s.Name+"…"
+				id, client, ctx := m.cur.ID, m.client, m.ctx
+				return m, tea.Batch(m.spin.Tick, func() tea.Msg {
+					err := client.setState(ctx, id, s.ID)
+					if err == nil {
+						fresh, e := client.freshIssue(ctx, id)
+						if e == nil {
+							s = fresh.State
+						}
+					}
+					return stateSetMsg{id, s, err}
+				})
+			}
+		}
+		return m, nil
+
+	case screenIssue, screenProject:
+		switch k.String() {
+		case "up", "k", "ctrl+p":
+			m.scrollBody(-1)
+			return m, nil
+		case "down", "j", "ctrl+n":
+			m.scrollBody(1)
+			return m, nil
+		case "pgup":
+			m.scrollBody(-max(1, m.bodyRoom()-2))
+			return m, nil
+		case "pgdown", " ":
+			m.scrollBody(max(1, m.bodyRoom()-2))
+			return m, nil
+		}
+	}
+
+	switch m.screen {
+	case screenIssue:
+		is := *m.cur
+		switch k.String() {
+		case "esc", "q", "left", "h":
+			if m.direct && (k.String() == "esc" || k.String() == "q") {
+				return m.leave() // opened on this issue: there's no list to go back to
+			}
+			m.screen, m.err, m.flash, m.direct = screenList, "", "", false
+		case "o":
+			return m, m.openURL(is.URL)
+		case "w", "enter":
+			return m.runWorktree(issueTarget(is), &is, false)
+		case "s":
+			return m.runWorktree(issueTarget(is), &is, true)
+		case "c":
+			return m.openStatusPicker()
+		case "y":
+			branch := issueTarget(is).Branch
+			if term, err := copyText(branch); err != nil {
+				m.err = err.Error()
+			} else {
+				m.flash = copied(branch, term)
+			}
+		}
+		return m, nil
+
+	case screenProject:
+		p := *m.curProject
+		switch k.String() {
+		case "esc", "q", "left", "h":
+			m.screen, m.err, m.flash = screenList, "", ""
+		case "o":
+			return m, m.openURL(p.URL)
+		case "w":
+			return m.runWorktree(projectTarget(p), nil, false)
+		case "s":
+			return m.runProjectStart(p)
+		case "c":
+			return m.openCreate(&p, nil)
+		case "i", "enter":
+			m.screen = screenList
+			m.drilled, m.projIss = &p, nil
+			m.filter.SetValue("")
+			m.cursor, m.offset, m.chose, m.mode = 0, 0, false, modeLoading
+			return m, tea.Batch(m.spin.Tick, m.loadProjectIssues(p))
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// openURL opens Jira in the browser, in the background: opening can take
+// a moment, and the picker shouldn't wait on it. The demo's workspace doesn't
+// exist, so it only says where it would have gone.
+func (m *model) openURL(u string) tea.Cmd {
+	if _, demo := m.client.(*demoSource); demo {
+		m.flash = "Demo: would open " + u
+		return nil
+	}
+	if !isJiraURL(u) {
+		m.err = "Not opening " + u + ": not a Jira link"
+		return nil
+	}
+	// A browser here wouldn't be in front of you (over SSH), or there's none
+	// to open (no display): the link goes on your clipboard instead.
+	if noBrowser() {
+		if term, err := copyText(u); err != nil {
+			m.err = "Couldn't copy the link: " + err.Error()
+		} else {
+			m.flash = copied("the link", term) + ": open it in your browser"
+		}
+		return nil
+	}
+	return func() tea.Msg {
+		if err := openBrowser(u); err != nil {
+			return noteMsg("Couldn't open the browser: " + err.Error())
+		}
+		return nil
+	}
+}
+
+// isJiraURL admits HTTPS links on Atlassian Jira Cloud sites. The URL comes from the
+// API and goes to `open` or `xdg-open`, which would as happily launch a
+// file: path or another app's URL scheme.
+func isJiraURL(u string) bool {
+	p, err := url.Parse(u)
+	if err != nil || p.Scheme != "https" || p.User != nil {
+		return false
+	}
+	h := p.Hostname()
+	return strings.HasSuffix(strings.ToLower(h), ".atlassian.net")
+}
+
+// ── views ─────────────────────────────────────────────────────────────────────
+
+func field(name, value string) string {
+	if value == "" {
+		return ""
+	}
+	return " " + styleDim.Render(fmt.Sprintf("%-9s", name)) + " " + value + "\n"
+}
+
+func (m model) viewIssue() string {
+	header := m.issueHeader()
+	var b strings.Builder
+	b.WriteString(header)
+	room := m.issueBodyRoom(header)
+	switch {
+	case m.screen == screenStatus:
+		b.WriteString(m.viewStatusPicker(room))
+	case m.curDetail == nil:
+		b.WriteString(" " + m.spin.View() + styleDim.Render(" loading…") + "\n")
+	default:
+		b.WriteString(window(m.bodyLines(), m.scroll, room))
+	}
+	return b.String()
+}
+
+// issueBodyRoom is how many lines are left under the header for the
+// description or the status picker.
+func (m model) issueBodyRoom(header string) int {
+	used := strings.Count(header, "\n") + 2 // + tabs line + blank line
+	return m.height - used - 2              // status line + footer
+}
+
+// bodyLines is the rendered Markdown under the current detail screen's header.
+func (m model) bodyLines() []string {
+	w := max(20, m.width)
+	switch {
+	case m.screen == screenProject && m.projDetail != nil:
+		text := m.projDetail.Content
+		if strings.TrimSpace(text) == "" {
+			text = m.projDetail.Description
+		}
+		return m.md.lines(m.curProject.ID, text, w)
+	case m.screen == screenIssue && m.curDetail != nil:
+		return m.md.lines(m.cur.ID, m.curDetail.Description, w)
+	}
+	return nil
+}
+
+func (m model) bodyRoom() int {
+	if m.screen == screenProject {
+		return m.issueBodyRoom(m.projectHeader())
+	}
+	return m.issueBodyRoom(m.issueHeader())
+}
+
+func (m *model) scrollBody(delta int) {
+	m.scroll = min(max(0, m.scroll+delta), maxScroll(m.bodyLines(), m.bodyRoom()))
+}
+
+// issueHeader is everything on the issue screen above the description.
+func (m model) issueHeader() string {
+	is := m.cur
+	w := max(20, m.width-2)
+	var b strings.Builder
+
+	// The state as a pill, in Jira's colour for it; with none, the mark.
+	head := " " + colored(stateIcon(is.State), is.State.Color) + " " + is.State.Name
+	if is.State.Color != "" {
+		head = " " + pill(lipgloss.Color(is.State.Color), is.State.Name)
+	}
+	if m.curDetail != nil && is.Priority > 0 && m.curDetail.PriorityLabel != "" {
+		p := m.curDetail.PriorityLabel
+		if is.Priority == 1 {
+			p = styleUrgent.Render("! " + p)
+		}
+		head += styleDim.Render("  ·  ") + p
+	}
+	b.WriteString(head + "\n\n")
+	b.WriteString(lipgloss.NewStyle().Width(w).PaddingLeft(1).Bold(true).Render(is.Title) + "\n\n")
+
+	if is.Project != nil {
+		b.WriteString(field("Project", is.Project.Name))
+	}
+	if is.Assignee != nil {
+		name := is.Assignee.Name
+		if is.Assignee.IsMe {
+			name += styleDim.Render(" (you)")
+		}
+		b.WriteString(field("Assignee", name))
+	} else {
+		b.WriteString(field("Assignee", styleDim.Render("nobody")))
+	}
+	if d := m.curDetail; d != nil {
+		var labels []string
+		for _, l := range d.Labels.Nodes {
+			labels = append(labels, colored("●", l.Color)+" "+l.Name)
+		}
+		b.WriteString(field("Labels", strings.Join(labels, "  ")))
+		if d.Cycle != nil {
+			c := fmt.Sprintf("Cycle %d", d.Cycle.Number)
+			if d.Cycle.Name != "" {
+				c += " · " + d.Cycle.Name
+			}
+			b.WriteString(field("Cycle", c))
+		}
+		b.WriteString(field("Due", d.DueDate))
+	}
+	t := issueTarget(*is)
+	tree := styleDim.Render("no worktree yet")
+	if m.worktrees[t.Branch] {
+		tree = styleTree.Render("⌥ worktree")
+	}
+	b.WriteString(field("Branch", styleBranch.Render(t.Branch)+"  "+tree))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// pickerStart is the first state shown when a team has more states than fit.
+func (m model) pickerStart(room int) int {
+	if room > 1 && m.stateCursor >= room-1 {
+		return m.stateCursor - room + 2
+	}
+	return 0
+}
+
+func (m model) viewStatusPicker(room int) string {
+	states := m.states[m.cur.ID]
+	if len(states) == 0 {
+		return " " + m.spin.View() + styleDim.Render(" loading statuses…") + "\n"
+	}
+	var b strings.Builder
+	b.WriteString(styleHeader.Render(" Move to") + "\n")
+	start := m.pickerStart(room)
+	for i := start; i < len(states) && i-start < max(1, room-1); i++ {
+		s := states[i]
+		line := "   " + colored(stateIcon(s), s.Color) + " " + s.Name
+		if s.ID == m.cur.State.ID {
+			line += styleDim.Render("  current")
+		}
+		if i == m.stateCursor {
+			line = highlight(" ›"+line[2:], max(20, m.width-2))
+		}
+		b.WriteString(line + "\n")
+	}
+	return b.String()
+}
+
+func (m model) viewProject() string {
+	header := m.projectHeader()
+	if m.projDetail == nil {
+		return header + " " + m.spin.View() + styleDim.Render(" loading…") + "\n"
+	}
+	return header + window(m.bodyLines(), m.scroll, m.issueBodyRoom(header))
+}
+
+func (m model) projectHeader() string {
+	p := m.curProject
+	w := max(20, m.width-2)
+	var b strings.Builder
+	b.WriteString(" " + colored(projectIcon(p.Status.Type), p.Status.Color) + " " + p.Status.Name)
+	if p.Progress >= 0 {
+		b.WriteString(styleDim.Render(fmt.Sprintf("  ·  %d%%", int(p.Progress*100+0.5))))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(lipgloss.NewStyle().Width(w).PaddingLeft(1).Bold(true).Render(p.Name) + "\n\n")
+	if d := m.projDetail; d != nil {
+		if d.Lead != nil {
+			b.WriteString(field("Lead", d.Lead.Name))
+		}
+		b.WriteString(field("Start", d.StartDate))
+	}
+	b.WriteString(field("Target", p.TargetDate))
+	t := projectTarget(*p)
+	tree := styleDim.Render("no worktree yet")
+	if m.worktrees[t.Branch] {
+		tree = styleTree.Render("⌥ worktree")
+	}
+	b.WriteString(field("Branch", styleBranch.Render(t.Branch)+"  "+tree))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func (m model) detailFooter() []hint {
+	switch m.screen {
+	case screenCreate, screenCreated:
+		return m.createFooter()
+	case screenStatus:
+		return []hint{{"↑↓ choose", "", hintView}, {"enter move", "enter", hintAct}, {"esc cancel", "esc", hintQuiet}}
+	case screenProject:
+		return []hint{{"w worktree", "w", hintAct}, {"s start", "s", hintAct}, {"c new issue", "c", hintAct}, {"i issues", "i", hintView}, {"o open in Jira", "o", hintView}, {"esc back", "esc", hintQuiet}}
+	default:
+		if m.direct {
+			return []hint{{"w worktree", "w", hintAct}, {"s start", "s", hintAct}, {"c status", "c", hintAct}, {"o open in Jira", "o", hintView}, {"← lists", "left", hintView}, {m.escLabel(), "esc", hintQuiet}}
+		}
+		return []hint{{"w worktree", "w", hintAct}, {"s start", "s", hintAct}, {"c status", "c", hintAct}, {"o open in Jira", "o", hintView}, {"y copy branch", "y", hintView}, {"esc back", "esc", hintQuiet}}
+	}
+}
