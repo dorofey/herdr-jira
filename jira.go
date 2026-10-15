@@ -107,12 +107,33 @@ type jiraStatus struct {
 }
 
 func state(s jiraStatus) workflowState {
-	t, col := "unstarted", "#8c9bab"
+	t, col := "unstarted", "#f5cd47"
 	switch s.StatusCategory.Key {
 	case "indeterminate":
 		t, col = "started", "#579dff"
 	case "done":
 		t, col = "completed", "#4bce97"
+	}
+	// Jira categories describe workflow behavior; names distinguish the
+	// statuses within each category without changing start/ownership rules.
+	name := strings.ToLower(strings.Join(strings.Fields(strings.NewReplacer("-", " ", "_", " ").Replace(s.Name)), " "))
+	switch {
+	case strings.Contains(name, "cancel"), strings.Contains(name, "reject"), strings.Contains(name, "won't do"), strings.Contains(name, "wont do"):
+		col = "#f87171"
+	case s.StatusCategory.Key == "done":
+		// Keep completed statuses green.
+	case strings.Contains(name, "block"), strings.Contains(name, "imped"):
+		col = "#f87171"
+	case strings.Contains(name, "hold"), strings.Contains(name, "pause"), strings.Contains(name, "wait"):
+		col = "#fbbf24"
+	case strings.Contains(name, "review"), strings.Contains(name, "approval"):
+		col = "#c084fc"
+	case strings.Contains(name, "test"), strings.Contains(name, "quality"), name == "qa":
+		col = "#2dd4bf"
+	case strings.Contains(name, "backlog"):
+		col = "#a5b4fc"
+	case strings.Contains(name, "triage"):
+		col = "#fb923c"
 	}
 	return workflowState{ID: s.ID, Name: s.Name, Type: t, Color: col}
 }

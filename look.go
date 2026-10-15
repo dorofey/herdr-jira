@@ -166,7 +166,13 @@ func useTones(t tones) {
 	styleDim = fg(t.Dim)
 	styleTabOn = fg(t.Accent).Bold(true).Underline(true)
 	styleHintHot = fg(t.Accent).Bold(true).Underline(true)
-	styleSelected = lipgloss.NewStyle().Background(t.Selection)
+	selectionInk := lipgloss.Color("#ffffff")
+	if accent, ok := t.Accent.(lipgloss.Color); ok {
+		if light, known := isLight(string(accent)); known && light {
+			selectionInk = lipgloss.Color("#000000")
+		}
+	}
+	styleSelected = lipgloss.NewStyle().Background(t.Accent).Foreground(selectionInk).Bold(true)
 	styleOK, styleErr, styleWarn = fg(t.Green), fg(t.Red), fg(t.Yellow)
 	styleUrgent = fg(t.Peach).Bold(true)
 	styleTree = fg(t.Accent)

@@ -1600,7 +1600,7 @@ func (m model) viewRow(r row, selected bool) string {
 		line = fitRow(" "+colored(projectIcon(p.Status.Type), p.Status.Color)+" ", p.Name, m.projectMeta(p), m.width)
 	}
 	if selected {
-		return highlight(line, m.width)
+		return highlight("›"+strings.TrimPrefix(line, " "), m.width)
 	}
 	return line
 }
@@ -1693,16 +1693,10 @@ func fitRow(left, title string, ms []meta, w int) string {
 	return left + styleLead.Render(title) + strings.Repeat(" ", pad) + right
 }
 
-// highlight gives a whole row the selection background, w cells wide. The
-// row's own coloured pieces each end in a style reset, which would also end
-// the background, so it's switched back on after every one.
+// highlight uses one contrasting style across the full row, including padding.
+// Remove inline colours so status and metadata remain legible on the accent.
 func highlight(line string, w int) string {
-	on := styleSelected.Render("x")
-	on = on[:strings.Index(on, "x")] // the escape that turns the background on
-	if on != "" {
-		line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+on)
-	}
-	return styleSelected.Width(w).Render(line)
+	return styleSelected.Width(w).Render(ansi.Strip(line))
 }
 
 func (m model) footer() []hint {
